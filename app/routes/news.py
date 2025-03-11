@@ -1,51 +1,123 @@
-from fastapi import APIRouter, Depends, HTTPException
+import os
+import datetime
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
 from app.database import get_db
 from app.models import News
+
+# Import advanced analysis functions from services
 from app.services.nlp_service import analyze_text
+from app.services.media_service import analyze_image, analyze_video
+from app.services.social_service import analyze_twitter, analyze_facebook, analyze_instagram
+from app.services.scraper import scrape_headlines
 
-# Define a Pydantic model for the input data
-class NewsInput(BaseModel):
-    title: str      # The title of the news article
-    content: str    # The full content of the news article
-    source: str = None  # Optional source of the news article
-
-# Create an API router for news-related endpoints
 router = APIRouter()
 
 @router.post("/verify", summary="Verify the veracity of news", response_model=dict)
-def verify_news(news_input: NewsInput, db: Session = Depends(get_db)):
+async def verify_news(
+    input_type: str = Form(...),         # Expected values: "text", "link", "image", "video"
+    input_data: str = Form(None),          # For text or link input (a single field for both)
+    file: UploadFile = File(None),         # For image or video input
+    db: Session = Depends(get_db)
+):
     """
-    Endpoint to verify the veracity of a news article.
-    It accepts a JSON payload with the title, content, and optional source.
-    The content is analyzed using the NLP service to determine a veracity score and generate an analysis report.
-    The news article is then stored in the database.
+    This endpoint processes the user input (which can be text, link, image, or video)
+    and performs advanced veracity analysis. It integrates:
+      - Primary analysis based on the input content (text analysis, media analysis, or scraping for links).
+      - Social media analysis from Twitter, Facebook, and Instagram.
+      - Aggregates the results into a final veracity score and detailed report.
+
+    Input requirements:
+      - For "text" or "link": only the 'input_data' field is required.
+      - For "image" or "video": only the file upload is required.
     """
-    # Validate input data: title and content are required
-    if not news_input.title or not news_input.content:
-        raise HTTPException(status_code=400, detail="Title and content are required")
-    
-    # Analyze the news content using the NLP service (dummy analysis for MVP)
-    veracity_score, analysis_report = analyze_text(news_input.content)
-    
-    # Create a new News record
-    new_news = News(
-        title=news_input.title,
-        content=news_input.content,
-        source=news_input.source or "Unknown",
-        veracity_score=veracity_score,
-        is_fake=(veracity_score < 0.5),  # Mark as fake if score is below 0.5
-        analysis_report=analysis_report
-    )
-    db.add(new_news)
-    db.commit()
-    db.refresh(new_news)
-    
-    # Return the result as a JSON response
-    return {
-        "id": new_news.id,
-        "veracity_score": new_news.veracity_score,
-        "is_fake": new_news.is_fake,
-        "analysis_report": new_news.analysis_report
+    primary_report = {}
+
+    if input_type.lower() == "text":
+        if not input_data:
+            raise HTTPException(status_code=400, detail="Text content is required for text input.")
+        score, report = analyze_text(input_data)
+        primary_report = {"veracity_score": score, "analysis_report": report}
+
+    elif input_type.lower() == "link":
+        if not input_data:
+            raise HTTPException(status_code=400, detail="URL is required for link input.")
+        # Scrape the link to extract headlines (as a proxy for article content)
+        headlines = scrape_headlines(input_data)
+        if not headlines:
+            raise HTTPException(status_code=400, detail="Could not extract content from the provided URL.")
+        combined_text = " ".join(headlines)
+        score, report = analyze_text(combined_text)
+        primary_report = {
+            "veracity_score": score,
+            "analysis_report": report,
+            "extracted_headlines": headlines
+        }
+
+    elif input_type.lower() == "image":
+        if file is None:
+            raise HTTPException(status_code=400, detail="Image file is required for image input.")
+        file_location = f"temp_{file.filename}"
+        with open(file_location, "wb") as f:
+            f.write(await file.read())
+        score, report = analyze_image(file_location)
+        primary_report = {"veracity_score": score, "analysis_report": report}
+        os.remove(file_location)
+
+    elif input_type.lower() == "video":
+        if file is None:
+            raise HTTPException(status_code=400, detail="Video file is required for video input.")
+        file_location = f"temp_{file.filename}"
+        with open(file_location, "wb") as f:
+            f.write(await file.read())
+        score, report = analyze_video(file_location)
+        primary_report = {"veracity_score": score, "analysis_report": report}
+        os.remove(file_location)
+
+    else:
+        raise HTTPException(status_code=400, detail="Invalid input type provided.")
+
+    # Social media analysis integration:
+    # Use a snippet from the input_data (if available) or default keyword for social media search.
+    social_keyword = input_data.split()[0] if input_data else "news"
+    twitter_score, twitter_report = analyze_twitter(social_keyword)
+    facebook_score, facebook_report = analyze_facebook(social_keyword)
+    instagram_score, instagram_report = analyze_instagram(social_keyword)
+
+    social_media = {
+        "twitter": {"score": twitter_score, "report": twitter_report},
+        "facebook": {"score": facebook_score, "report": facebook_report},
+        "instagram": {"score": instagram_score, "report": instagram_report}
     }
+
+    # Calculate a weighted final veracity score:
+    # Primary analysis weight: 60%, Social media analysis weight: 40%
+    social_avg = (twitter_score + facebook_score + instagram_score) / 3
+    final_score = 0.6 * primary_report["veracity_score"] + 0.4 * social_avg
+
+    # Prepare the final integrated report
+    final_report = {
+        "input_type": input_type,
+        "primary_analysis": primary_report,
+        "social_media_analysis": social_media,
+        "final_veracity_score": final_score,
+        "conclusion": "News is likely authentic." if final_score > 0.5 else "News is likely fake."
+    }
+
+    # Optionally, save the record to the database for text and link inputs
+    if input_type.lower() in ["text", "link"]:
+        new_news = News(
+            title=input_data if input_data else (file.filename if file else "Media Analysis"),
+            content=input_data if input_data else "Media file analysis",
+            source=input_data if input_type.lower() == "link" else "User Submitted",
+            published_date=datetime.datetime.utcnow(),
+            veracity_score=final_score,
+            is_fake=(final_score < 0.5),
+            analysis_report=str(final_report)
+        )
+        db.add(new_news)
+        db.commit()
+        db.refresh(new_news)
+        final_report["news_record_id"] = new_news.id
+
+    return final_report
